@@ -1,0 +1,23 @@
+
+{
+  "name": "Urdu2Roman Pro Converter",
+  "short_name": "Urdu2Roman",
+  "description": "High-performance Urdu to Roman English book converter.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2900/2900215.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2900/2900215.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

@@ -31,16 +31,16 @@ export class GeminiService {
       }
     });
 
-    // Add explicit instruction part for batches
-    parts.push({ text: "Transcribe (if image) and convert all the above Urdu content into Roman English. Keep the order of segments preserved." });
+    parts.push({ text: "Transcribe (if image) and convert all the above Urdu content into Roman English. Keep the order of segments preserved. Return only transliteration." });
 
     try {
       const result = await this.ai.models.generateContentStream({
-        model: 'gemini-flash-latest',
+        model: 'gemini-3-flash-preview',
         contents: [{ role: 'user', parts }],
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
           temperature: 0.1,
+          thinkingConfig: { thinkingBudget: 0 } // Disable thinking for pure transliteration speed
         },
       });
 
@@ -53,17 +53,5 @@ export class GeminiService {
       const msg = error?.message || 'Streaming conversion failed.';
       throw new Error(`AI Uplink Error: ${msg}`);
     }
-  }
-
-  async convertChunk(urduText: string): Promise<string> {
-    const response = await this.ai.models.generateContent({
-      model: 'gemini-flash-latest',
-      contents: urduText,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.1,
-      },
-    });
-    return response.text || '';
   }
 }

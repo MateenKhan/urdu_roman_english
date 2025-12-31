@@ -1,0 +1,14 @@
+
+{
+  "appId": "com.urdu2roman.app",
+  "appName": "Urdu2Roman Pro",
+  "webDir": ".",
+  "bundledWebRuntime": false,
+  "server": {
+    "allowNavigation": ["*"]
+  },
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true
+  }
+}

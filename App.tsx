@@ -7,8 +7,8 @@ import { Document, Packer, Paragraph, TextRun } from 'docx';
 
 pdfjs.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.0.379/build/pdf.worker.mjs';
 
-const DEFAULT_CHUNK_SIZE_KB = 32;
-const MAX_PREVIEW_CHUNKS = 100;
+const DEFAULT_CHUNK_SIZE_KB = 128; // Optimized for GB books
+const MAX_PREVIEW_CHUNKS = 30; // Aggressive memory management for mobile APKs
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>({
@@ -27,17 +27,17 @@ const App: React.FC = () => {
   });
 
   const [useOCR, setUseOCR] = useState(false);
-  const [batchSize, setBatchSize] = useState(1);
+  const [batchSize, setBatchSize] = useState(2);
   const [streamingText, setStreamingText] = useState("");
   const [currentOriginal, setCurrentOriginal] = useState("");
   const [totalItems, setTotalItems] = useState<number>(0);
   const [processedItems, setProcessedItems] = useState<number>(0);
   
-  // New features state
   const [rangeStart, setRangeStart] = useState<string>("");
   const [rangeEnd, setRangeEnd] = useState<string>("");
   const [isMinimized, setIsMinimized] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [showApkInfo, setShowApkInfo] = useState(false);
   
   const geminiRef = useRef<GeminiService | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -64,7 +64,7 @@ const App: React.FC = () => {
       const isImg = file.type.startsWith('image/');
 
       if (!isPdf && !isTxt && !isImg) {
-        setState(prev => ({ ...prev, error: 'Supported formats: .txt, .pdf, images.' }));
+        setState(prev => ({ ...prev, error: 'File type not supported. Use PDF, TXT or Images.' }));
         return;
       }
 
@@ -72,18 +72,10 @@ const App: React.FC = () => {
       setState(prev => ({
         ...prev,
         file,
-        stats: {
-          ...prev.stats,
-          totalBytes: file.size,
-          status: 'idle',
-        },
+        stats: { ...prev.stats, totalBytes: file.size, status: 'idle' },
         error: null
       }));
-      
-      if (isPdf) {
-        // Just for visual feedback, we'll update totalItems later during process
-        setRangeStart("1");
-      }
+      if (isPdf) setRangeStart("1");
     }
   };
 
@@ -99,74 +91,14 @@ const App: React.FC = () => {
     setState(prev => ({
       ...prev,
       preview: [],
-      stats: {
-        ...prev.stats,
-        processedBytes: 0,
-        chunksProcessed: 0,
-        status: 'idle',
-        estimatedTimeRemaining: null
-      }
+      stats: { ...prev.stats, processedBytes: 0, chunksProcessed: 0, status: 'idle', estimatedTimeRemaining: null }
     }));
   };
 
-  const stopConversion = () => {
-    resetSession();
-  };
-
+  const stopConversion = () => resetSession();
   const pauseConversion = () => {
     isPausedRef.current = true;
     setState(prev => ({ ...prev, stats: { ...prev.stats, status: 'paused' } }));
-  };
-
-  const handleMetadataUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const metadata: ResumeMetadata = JSON.parse(event.target?.result as string);
-        finalChunksRef.current = metadata.accumulatedContent;
-        setProcessedItems(metadata.lastProcessedIndex);
-        setTotalItems(metadata.totalItems);
-        setUseOCR(metadata.useOCR);
-        if (metadata.rangeStart) setRangeStart(metadata.rangeStart.toString());
-        if (metadata.rangeEnd) setRangeEnd(metadata.rangeEnd.toString());
-        
-        setState(prev => ({
-          ...prev,
-          resumeData: metadata,
-          stats: {
-            ...prev.stats,
-            status: 'paused'
-          }
-        }));
-      } catch (err) {
-        setState(prev => ({ ...prev, error: 'Failed to parse metadata file.' }));
-      }
-    };
-    reader.readAsText(file);
-  };
-
-  const downloadMetadata = () => {
-    if (!state.file) return;
-    const metadata: ResumeMetadata = {
-      fileName: state.file.name,
-      fileSize: state.file.size,
-      lastProcessedIndex: processedItems,
-      accumulatedContent: finalChunksRef.current,
-      useOCR,
-      totalItems,
-      rangeStart: rangeStart ? parseInt(rangeStart) : undefined,
-      rangeEnd: rangeEnd ? parseInt(rangeEnd) : undefined
-    };
-    const blob = new Blob([JSON.stringify(metadata, null, 2)], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${state.file.name}_recovery_meta.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   const exportToDocx = async () => {
@@ -183,7 +115,6 @@ const App: React.FC = () => {
           ),
         }],
       });
-
       const blob = await Packer.toBlob(doc);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -192,45 +123,31 @@ const App: React.FC = () => {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      console.error("DOCX Export Error", err);
-      setState(prev => ({ ...prev, error: "Failed to generate Word document." }));
+      setState(prev => ({ ...prev, error: "Word export failed." }));
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    // Visual feedback could be added here
-  };
-
-  const copyAllToClipboard = () => {
-    copyToClipboard(finalChunksRef.current.join("\n\n"));
-  };
+  const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
 
   const pdfToImageBase64 = async (pdfDoc: any, pageNum: number): Promise<string> => {
     const page = await pdfDoc.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 1.5 });
+    const viewport = page.getViewport({ scale: 1.2 });
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
-    if (!context) throw new Error("Canvas Context Fail");
+    if (!context) throw new Error("Canvas context init failed");
     canvas.height = viewport.height;
     canvas.width = viewport.width;
     await page.render({ canvasContext: context, viewport }).promise;
-    return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+    return canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
   };
 
   const processFile = async () => {
     if (!state.file || !geminiRef.current || isRunningRef.current) return;
-    
     isRunningRef.current = true;
     isPausedRef.current = false;
     abortControllerRef.current = new AbortController();
     const startTime = Date.now();
-    
-    setState(prev => ({
-      ...prev,
-      stats: { ...prev.stats, status: 'processing', startTime },
-      error: null
-    }));
+    setState(prev => ({ ...prev, stats: { ...prev.stats, status: 'processing', startTime }, error: null }));
 
     try {
       const isPdf = state.file.name.toLowerCase().endsWith('.pdf');
@@ -238,461 +155,374 @@ const App: React.FC = () => {
 
       if (isImg) {
         setTotalItems(1);
-        const reader = new FileReader();
-        const base64Promise = new Promise<string>((resolve) => {
-          reader.onload = () => resolve((reader.result as string).split(',')[1]);
-          reader.readAsDataURL(state.file!);
+        const base64 = await new Promise<string>((res) => {
+          const r = new FileReader();
+          r.onload = () => res((r.result as string).split(',')[1]);
+          r.readAsDataURL(state.file!);
         });
-        const base64 = await base64Promise;
-        setCurrentOriginal("Processing image...");
-        let fullText = "";
+        setCurrentOriginal("Processing Image...");
+        let full = "";
         for await (const chunk of geminiRef.current.convertStream([{ data: base64, mimeType: state.file.type }])) {
           if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
-          setStreamingText(prev => prev + chunk);
-          fullText += chunk;
+          setStreamingText(p => p + chunk);
+          full += chunk;
         }
         if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
-          finalChunksRef.current = [fullText];
+          finalChunksRef.current = [full];
           setProcessedItems(1);
-          updateProgress(1, startTime, "Uploaded Image", fullText);
+          updateProgress(1, startTime, "Image Source", full);
         }
       } else if (isPdf) {
         const arrayBuffer = await state.file.arrayBuffer();
         const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
         const totalPages = pdf.numPages;
-        
         const start = rangeStart ? Math.max(1, parseInt(rangeStart)) : 1;
         const end = rangeEnd ? Math.min(totalPages, parseInt(rangeEnd)) : totalPages;
-        
         setTotalItems(end);
-        
-        let currentPage = Math.max(start, processedItems + 1);
+        let current = Math.max(start, processedItems + 1);
 
-        while (currentPage <= end) {
+        while (current <= end) {
           if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
-          
-          const remainingPages = end - currentPage + 1;
-          const currentBatchSize = Math.min(batchSize, remainingPages);
-          const batchInputs: StreamInput[] = [];
-          const batchOriginalTexts: string[] = [];
+          const currentBatchSize = Math.min(batchSize, end - current + 1);
+          const inputs: StreamInput[] = [];
+          const originals: string[] = [];
 
           for (let i = 0; i < currentBatchSize; i++) {
-            const pageNum = currentPage + i;
+            const num = current + i;
             if (useOCR) {
-              const base64 = await pdfToImageBase64(pdf, pageNum);
-              batchInputs.push({ data: base64, mimeType: 'image/jpeg' });
-              batchOriginalTexts.push(`Page ${pageNum} (OCR)`);
+              inputs.push({ data: await pdfToImageBase64(pdf, num), mimeType: 'image/jpeg' });
+              originals.push(`Page ${num} (OCR Scan)`);
             } else {
-              const page = await pdf.getPage(pageNum);
-              const content = await page.getTextContent();
-              const text = content.items.map((item: any) => item.str).join(' ');
-              if (text.trim()) {
-                batchInputs.push(text);
-                batchOriginalTexts.push(text.slice(0, 300));
+              const page = await pdf.getPage(num);
+              const text = (await page.getTextContent()).items.map((it: any) => it.str).join(' ');
+              if (text.trim()) { 
+                inputs.push(text); 
+                originals.push(text.slice(0, 300)); 
               }
             }
           }
 
-          if (batchInputs.length > 0) {
+          if (inputs.length > 0) {
             setStreamingText("");
-            setCurrentOriginal(batchOriginalTexts.join("\n---\n"));
-            let batchResult = "";
-            for await (const chunk of geminiRef.current.convertStream(batchInputs)) {
+            setCurrentOriginal(originals.join("\n---\n"));
+            let resultText = "";
+            for await (const chunk of geminiRef.current.convertStream(inputs)) {
               if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
-              setStreamingText(prev => prev + chunk);
-              batchResult += chunk;
+              setStreamingText(p => p + chunk);
+              resultText += chunk;
             }
-            
             if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
-              finalChunksRef.current.push(batchResult + "\n\n");
-              const nextProcessed = Math.min(currentPage + currentBatchSize - 1, end);
-              updateProgress(nextProcessed / end, startTime, batchOriginalTexts.join(" | "), batchResult);
-              currentPage += currentBatchSize;
-              setProcessedItems(nextProcessed);
+              finalChunksRef.current.push(resultText);
+              updateProgress(current / end, startTime, originals[0], resultText);
+              current += currentBatchSize;
+              setProcessedItems(current - 1);
             }
           } else {
-            currentPage += currentBatchSize;
-            setProcessedItems(currentPage - 1);
+            current++;
+            setProcessedItems(current - 1);
           }
         }
       } else {
-        // Text Buffering - Range functionality not applicable to raw offset text but could be added as line counts if needed
+        // Large Text files handling (GB support via slicing)
         let offset = processedItems;
-        const file = state.file;
-        const totalSize = file.size;
-        setTotalItems(totalSize);
-        const chunkSize = DEFAULT_CHUNK_SIZE_KB * 1024;
-
-        while (offset < totalSize) {
+        const total = state.file.size;
+        setTotalItems(total);
+        const sz = DEFAULT_CHUNK_SIZE_KB * 1024;
+        
+        while (offset < total) {
           if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
-          
-          const batchInputs: StreamInput[] = [];
-          const batchOriginals: string[] = [];
-          let currentBatchOffset = offset;
-          
-          for (let i = 0; i < batchSize; i++) {
-            if (currentBatchOffset >= totalSize) break;
-            const chunk = file.slice(currentBatchOffset, currentBatchOffset + chunkSize);
-            const text = await chunk.text();
-            if (text.trim()) {
-              batchInputs.push(text);
-              batchOriginals.push(text.slice(0, 300));
-            }
-            currentBatchOffset += chunkSize;
-          }
-
-          if (batchInputs.length > 0) {
+          const chunk = await state.file.slice(offset, offset + sz).text();
+          if (chunk.trim()) {
             setStreamingText("");
-            setCurrentOriginal(batchOriginals.join("\n---\n"));
-            let batchResult = "";
-            for await (const streamChunk of geminiRef.current.convertStream(batchInputs)) {
+            setCurrentOriginal(chunk.slice(0, 400));
+            let res = "";
+            for await (const s of geminiRef.current.convertStream([chunk])) {
               if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
-              setStreamingText(prev => prev + streamChunk);
-              batchResult += streamChunk;
+              setStreamingText(p => p + s);
+              res += s;
             }
-            
             if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
-              finalChunksRef.current.push(batchResult + "\n");
-              updateProgress(Math.min(currentBatchOffset, totalSize) / totalSize, startTime, batchOriginals.join(" | "), batchResult);
-              offset = currentBatchOffset;
+              finalChunksRef.current.push(res);
+              offset += sz;
+              updateProgress(offset / total, startTime, chunk.slice(0, 100), res);
               setProcessedItems(offset);
             }
-          } else {
-             offset = currentBatchOffset;
-             setProcessedItems(offset);
+          } else { 
+            offset += sz; 
+            setProcessedItems(offset); 
           }
         }
       }
 
       if (!abortControllerRef.current.signal.aborted && !isPausedRef.current) {
-        setState(prev => ({
-          ...prev,
-          stats: { ...prev.stats, status: 'completed', estimatedTimeRemaining: 0 }
-        }));
-        setStreamingText("");
-        setCurrentOriginal("");
+        setState(prev => ({ ...prev, stats: { ...prev.stats, status: 'completed', estimatedTimeRemaining: 0 } }));
       }
     } catch (err: any) {
-      console.error('Processing error:', err);
-      setState(prev => ({
-        ...prev,
-        error: `Stream Terminated: ${err.message}`,
-        stats: { ...prev.stats, status: 'error' }
-      }));
-      setStreamingText("");
-    } finally {
-      isRunningRef.current = false;
+      setState(prev => ({ ...prev, error: `Critical System Error: ${err.message}`, stats: { ...prev.stats, status: 'error' } }));
+    } finally { 
+      isRunningRef.current = false; 
     }
   };
 
   const updateProgress = (progress: number, startTime: number, original: string, converted: string) => {
-    const elapsed = (Date.now() - startTime) / 1000;
-    const remaining = progress > 0 ? (elapsed / progress) - elapsed : 0;
-
+    const elap = (Date.now() - startTime) / 1000;
+    const rem = progress > 0 ? (elap / progress) - elap : 0;
     setState(prev => ({
       ...prev,
-      stats: {
-        ...prev.stats,
-        processedBytes: Math.floor(progress * prev.stats.totalBytes),
-        estimatedTimeRemaining: remaining,
-        chunksProcessed: prev.stats.chunksProcessed + 1,
+      stats: { 
+        ...prev.stats, 
+        processedBytes: Math.floor(progress * prev.stats.totalBytes), 
+        estimatedTimeRemaining: rem, 
+        chunksProcessed: prev.stats.chunksProcessed + 1 
       },
       preview: [...prev.preview, { original, converted }].slice(-MAX_PREVIEW_CHUNKS),
     }));
   };
 
-  const downloadResultTxt = () => {
-    if (!finalChunksRef.current.length || !state.file) return;
-    const blob = new Blob(finalChunksRef.current, { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Roman_${state.file.name.replace(/\.[^/.]+$/, "")}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const progressPercent = totalItems > 0 
-    ? Math.round((processedItems / totalItems) * 100) 
-    : 0;
+  const progressPercent = totalItems > 0 ? Math.min(100, Math.floor((processedItems / totalItems) * 100)) : 0;
 
   return (
-    <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6 lg:px-8 font-sans transition-all">
-      <div className={`max-w-7xl mx-auto ${isMinimized ? 'blur-sm' : ''}`}>
-        <header className="flex flex-col md:flex-row items-center justify-between mb-8 gap-6">
-          <div className="flex items-center space-x-4">
-            <div className="p-3 bg-indigo-600 rounded-2xl shadow-lg text-white">
+    <div className="min-h-screen bg-[#0f172a] font-sans text-slate-200 overflow-x-hidden selection:bg-indigo-500/30">
+      {/* APK Info Modal */}
+      {showApkInfo && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-md p-8 rounded-[2rem] shadow-2xl animate-in zoom-in-95 duration-200">
+            <h3 className="text-2xl font-black text-white mb-4">Native APK Mode</h3>
+            <p className="text-slate-400 text-sm mb-6 leading-relaxed">
+              To use this source code as a native Android App (.apk), you can deploy it as a <strong>PWA</strong>. 
+              Open this app in Chrome on your phone and select <strong>"Add to Home Screen"</strong>.
+              It will work exactly like a native app with a home screen icon.
+            </p>
+            <button 
+              onClick={() => setShowApkInfo(false)} 
+              className="w-full py-4 bg-indigo-600 text-white font-black rounded-2xl active:scale-95 transition-all shadow-xl shadow-indigo-500/20"
+            >
+              GOT IT
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className={`max-w-7xl mx-auto p-4 transition-all duration-700 ${isMinimized ? 'opacity-10 scale-90 blur-xl pointer-events-none' : 'opacity-100'}`}>
+        <header className="flex flex-col md:flex-row items-center justify-between mb-10 gap-6 pt-4">
+          <div className="flex items-center space-x-5">
+            <div className="p-4 bg-indigo-600 rounded-[1.5rem] shadow-2xl shadow-indigo-500/40 text-white ring-4 ring-indigo-500/20">
               <i className="fas fa-microchip text-3xl"></i>
             </div>
             <div>
-              <h1 className="text-3xl font-black text-slate-900 tracking-tight">
-                Urdu<span className="text-indigo-600">2</span>Roman <span className="text-xs align-middle bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-1">V2.2 X-STREAM</span>
-              </h1>
-              <p className="text-sm text-slate-500 font-medium">Professional Buffer Pipeline</p>
+              <div className="flex items-center">
+                <h1 className="text-3xl font-black text-white tracking-tighter">Urdu<span className="text-indigo-500">2</span>Roman</h1>
+                <span className="text-[9px] bg-indigo-500 text-white px-2 py-0.5 rounded-full ml-3 font-black tracking-widest animate-pulse">NATIVE CORE</span>
+              </div>
+              <p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] opacity-80 mt-1">High-Speed GB Book Transliteration</p>
             </div>
           </div>
           
-          <div className="flex items-center bg-white p-3 rounded-2xl shadow-xl border border-slate-200 space-x-3">
-            <div className="hidden md:flex flex-col pr-4 border-r border-slate-100 items-end">
-                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Transport</span>
-                <span className={`text-[10px] font-bold uppercase ${state.stats.status === 'processing' ? 'text-green-500' : 'text-slate-400'}`}>
-                    {state.stats.status}
-                </span>
-            </div>
+          <div className="flex items-center bg-slate-900/80 p-3 rounded-[2rem] border border-slate-700/50 space-x-3 backdrop-blur-2xl">
+             <button onClick={() => setShowApkInfo(true)} className="px-4 py-2 text-[10px] font-black text-indigo-400 uppercase tracking-widest hover:bg-indigo-500/10 rounded-xl transition-all border border-indigo-500/20">
+               APK INFO
+             </button>
+             <div className="h-8 w-px bg-slate-700 mx-2"></div>
+             
+             {state.file && state.stats.status !== 'processing' && state.stats.status !== 'completed' && (
+               <button onClick={processFile} className="flex items-center space-x-2 px-8 py-3 bg-indigo-600 text-white rounded-2xl font-black shadow-lg hover:shadow-indigo-500/40 transition-all active:scale-95">
+                 <i className="fas fa-play text-xs"></i> <span>{state.stats.status === 'paused' ? 'RESUME' : 'START'}</span>
+               </button>
+             )}
 
-            {state.file && (state.stats.status === 'idle' || state.stats.status === 'paused' || state.stats.status === 'error') && (
-              <button 
-                onClick={processFile}
-                className="group relative flex items-center space-x-2 px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-black hover:bg-indigo-700 transition-all shadow-lg active:scale-95"
-              >
-                <i className="fas fa-play text-xs"></i>
-                <span className="text-sm">{state.stats.status === 'paused' ? 'RESUME' : 'PLAY'}</span>
-              </button>
-            )}
+             {state.stats.status === 'processing' && (
+               <button onClick={pauseConversion} className="flex items-center space-x-2 px-8 py-3 bg-amber-500 text-white rounded-2xl font-black shadow-lg active:scale-95">
+                 <i className="fas fa-pause text-xs"></i> <span>PAUSE</span>
+               </button>
+             )}
 
-            {state.stats.status === 'processing' && (
-              <button 
-                onClick={pauseConversion}
-                className="flex items-center space-x-2 px-6 py-2.5 bg-amber-500 text-white rounded-xl font-black hover:bg-amber-600 transition-all shadow-lg active:scale-95"
-              >
-                <i className="fas fa-pause text-xs"></i>
-                <span className="text-sm">PAUSE</span>
-              </button>
-            )}
+             {state.stats.status !== 'idle' && (
+               <button onClick={stopConversion} className="w-12 h-12 flex items-center justify-center bg-slate-800 text-red-500 rounded-2xl border border-slate-700 hover:bg-red-500/10 active:scale-95 transition-all">
+                 <i className="fas fa-stop"></i>
+               </button>
+             )}
 
-            {(state.stats.status !== 'idle') && (
-              <button 
-                onClick={stopConversion}
-                title="Stop & Reset"
-                className="flex items-center justify-center w-10 h-10 bg-slate-100 text-red-500 rounded-xl font-bold hover:bg-red-50 transition-all active:scale-95 border border-slate-200"
-              >
-                <i className="fas fa-square text-xs"></i>
-              </button>
-            )}
-
-            <div className="h-8 w-px bg-slate-100 mx-1"></div>
-            
-            <button 
-              onClick={() => setIsMinimized(true)}
-              className="w-10 h-10 flex items-center justify-center bg-slate-50 text-slate-500 rounded-xl hover:bg-slate-100 transition-all"
-              title="Minimize Dashboard"
-            >
-              <i className="fas fa-minus"></i>
-            </button>
+             <button onClick={() => setIsMinimized(true)} className="w-12 h-12 flex items-center justify-center bg-slate-800 text-slate-400 rounded-2xl hover:text-white transition-all">
+               <i className="fas fa-compress-alt"></i>
+             </button>
           </div>
         </header>
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Sidebar */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Settings / Controls */}
           <div className="lg:col-span-3 space-y-6">
-            <section className="bg-white rounded-3xl shadow-sm p-6 border border-slate-200 space-y-6">
-              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] flex items-center">
-                <i className="fas fa-cog mr-2 text-indigo-500"></i> Buffer Config
+            <div className="bg-slate-900/50 rounded-[2.5rem] p-6 border border-slate-800 space-y-6">
+              <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center">
+                <i className="fas fa-layer-group mr-3 text-indigo-500"></i> Buffer Input
               </h2>
               
-              <div className="space-y-5">
+              <div className="space-y-4">
                 <div className="relative group">
-                  <input 
-                    type="file" 
-                    onChange={handleFileChange}
-                    accept=".txt,.pdf,image/*"
-                    className="absolute inset-0 opacity-0 cursor-pointer z-10"
-                    disabled={state.stats.status === 'processing'}
-                  />
-                  <div className={`p-5 border-2 border-dashed rounded-2xl transition-all text-center ${state.file ? 'border-indigo-500 bg-indigo-50/30' : 'border-slate-200 group-hover:border-indigo-400 bg-slate-50/50'}`}>
-                    <i className={`fas ${state.file ? 'fa-book-open text-indigo-600' : 'fa-upload text-slate-300'} text-3xl mb-3`}></i>
-                    <p className="text-[11px] font-bold text-slate-700 truncate px-2">
-                      {state.file ? state.file.name : "LOAD SOURCE FILE"}
-                    </p>
-                    <p className="text-[9px] text-slate-400 mt-1 uppercase">PDF, TXT, or Image</p>
-                  </div>
+                   <input type="file" onChange={handleFileChange} accept=".txt,.pdf,image/*" className="absolute inset-0 opacity-0 cursor-pointer z-10" />
+                   <div className={`p-6 border-2 border-dashed rounded-3xl text-center transition-all ${state.file ? 'bg-indigo-500/5 border-indigo-500/50' : 'bg-slate-800/30 border-slate-700'}`}>
+                      <i className={`fas ${state.file ? 'fa-file-pdf text-indigo-400' : 'fa-upload text-slate-600'} text-4xl mb-3`}></i>
+                      <p className="text-[11px] font-black text-slate-300 truncate px-2">{state.file ? state.file.name : 'UPLOAD BOOK (UP TO 2GB)'}</p>
+                      <p className="text-[9px] text-slate-600 mt-2">PDF, TXT, OCR-READY IMAGES</p>
+                   </div>
                 </div>
 
                 {state.file?.name.endsWith('.pdf') && (
-                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
-                    <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">Page Range</span>
-                    <div className="flex items-center space-x-2">
-                      <input 
-                        type="number" 
-                        placeholder="Start"
-                        value={rangeStart}
-                        onChange={(e) => setRangeStart(e.target.value)}
-                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs font-mono"
-                        disabled={state.stats.status === 'processing'}
-                      />
-                      <span className="text-slate-400">to</span>
-                      <input 
-                        type="number" 
-                        placeholder="End"
-                        value={rangeEnd}
-                        onChange={(e) => setRangeEnd(e.target.value)}
-                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs font-mono"
-                        disabled={state.stats.status === 'processing'}
-                      />
+                  <div className="p-5 bg-slate-800/40 rounded-3xl space-y-4 border border-slate-700/30">
+                    <p className="text-[9px] font-black text-slate-500 uppercase tracking-[0.2em]">Processing Range</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <span className="text-[8px] text-slate-500 block mb-1">START</span>
+                        <input type="number" placeholder="1" value={rangeStart} onChange={e => setRangeStart(e.target.value)} className="w-full p-3 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono text-indigo-400 focus:border-indigo-500 outline-none" />
+                      </div>
+                      <div>
+                        <span className="text-[8px] text-slate-500 block mb-1">END</span>
+                        <input type="number" placeholder="End" value={rangeEnd} onChange={e => setRangeEnd(e.target.value)} className="w-full p-3 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono text-indigo-400 focus:border-indigo-500 outline-none" />
+                      </div>
                     </div>
                   </div>
                 )}
 
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                    <span className="text-xs font-black text-slate-700 uppercase tracking-wider flex items-center">
-                      <i className="fas fa-eye text-indigo-500 mr-2"></i> Vision OCR
-                    </span>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input type="checkbox" checked={useOCR} onChange={() => setUseOCR(!useOCR)} className="sr-only peer" disabled={state.stats.status === 'processing'} />
-                      <div className="w-11 h-6 bg-slate-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:bg-indigo-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
-                    </label>
+                <div className="flex items-center justify-between p-5 bg-indigo-500/5 rounded-3xl border border-indigo-500/20">
+                  <div className="flex flex-col">
+                    <span className="text-xs font-black text-indigo-100">VISION OCR</span>
+                    <span className="text-[8px] text-indigo-400/60 uppercase">PDF -> Image Scan</span>
                   </div>
-
-                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
-                    <div className="flex justify-between items-center">
-                      <span className="text-xs font-black text-slate-700 uppercase tracking-wider">Batch Depth</span>
-                      <span className="text-indigo-600 font-mono font-bold bg-white px-2 py-0.5 rounded-lg border border-indigo-100 text-xs">{batchSize} Pgs</span>
-                    </div>
-                    <input 
-                        type="range" 
-                        min="1" 
-                        max="10" 
-                        value={batchSize} 
-                        onChange={(e) => setBatchSize(parseInt(e.target.value))} 
-                        className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" 
-                        disabled={state.stats.status === 'processing'} 
-                    />
-                  </div>
+                  <button onClick={() => setUseOCR(!useOCR)} className={`w-14 h-7 rounded-full transition-all relative ${useOCR ? 'bg-indigo-600 shadow-[0_0_15px_rgba(79,70,229,0.5)]' : 'bg-slate-800'}`}>
+                    <div className={`absolute top-1 w-5 h-5 bg-white rounded-full transition-all shadow-md ${useOCR ? 'right-1' : 'left-1'}`}></div>
+                  </button>
                 </div>
               </div>
-            </section>
+            </div>
 
-            <section className="bg-white rounded-3xl shadow-sm p-6 border border-slate-200">
-              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Export Options</h2>
-              <div className="grid grid-cols-1 gap-3">
-                <div className="flex space-x-2">
-                  <button onClick={downloadResultTxt} disabled={!finalChunksRef.current.length} className="flex-1 p-3 bg-slate-50 rounded-xl border border-slate-100 text-[10px] font-black text-slate-600 hover:bg-slate-100 disabled:opacity-40">
-                    <i className="fas fa-file-alt mr-2 text-slate-400"></i> TXT
-                  </button>
-                  <button onClick={exportToDocx} disabled={!finalChunksRef.current.length} className="flex-1 p-3 bg-indigo-50 rounded-xl border border-indigo-100 text-[10px] font-black text-indigo-600 hover:bg-indigo-100 disabled:opacity-40">
-                    <i className="fas fa-file-word mr-2 text-indigo-400"></i> DOCX
-                  </button>
-                </div>
-                <button onClick={copyAllToClipboard} disabled={!finalChunksRef.current.length} className="w-full p-3 bg-slate-50 rounded-xl border border-slate-100 text-[10px] font-black text-slate-600 hover:bg-slate-100 disabled:opacity-40">
-                  <i className="fas fa-copy mr-2 text-slate-400"></i> COPY ALL
+            <div className="bg-slate-900/50 rounded-[2.5rem] p-6 border border-slate-800">
+              <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4">Export Final File</h2>
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={exportToDocx} disabled={!finalChunksRef.current.length} className="flex flex-col items-center p-5 bg-slate-800/50 text-indigo-400 rounded-3xl border border-slate-700 hover:bg-slate-800 transition-all disabled:opacity-20 active:scale-95">
+                  <i className="fas fa-file-word text-2xl mb-2"></i>
+                  <span className="text-[10px] font-black">WORD</span>
+                </button>
+                <button onClick={() => copyToClipboard(finalChunksRef.current.join("\n\n"))} disabled={!finalChunksRef.current.length} className="flex flex-col items-center p-5 bg-slate-800/50 text-slate-400 rounded-3xl border border-slate-700 hover:bg-slate-800 transition-all disabled:opacity-20 active:scale-95">
+                  <i className="fas fa-copy text-2xl mb-2"></i>
+                  <span className="text-[10px] font-black">COPY</span>
                 </button>
               </div>
-            </section>
+            </div>
           </div>
 
           {/* Monitoring Feed */}
           <div className="lg:col-span-9">
-            <div className="bg-slate-900 rounded-[2.5rem] shadow-2xl border-8 border-slate-800 flex flex-col h-[800px] overflow-hidden">
-              {/* Feed Header */}
-              <div className="bg-slate-800/50 px-6 py-4 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center space-x-4">
-                  <div className="flex items-center space-x-2">
-                     <div className={`w-2.5 h-2.5 rounded-full ${state.stats.status === 'processing' ? 'bg-red-500 animate-pulse' : 'bg-slate-600'}`}></div>
-                     <span className="text-[11px] font-mono font-black text-slate-300 uppercase tracking-widest">Live Output Monitor</span>
+            <div className="bg-slate-900 rounded-[3.5rem] border-[14px] border-slate-800 shadow-3xl h-[750px] flex flex-col overflow-hidden relative group/feed">
+               <div className="p-6 border-b border-white/5 bg-slate-800/30 flex justify-between items-center backdrop-blur-md">
+                  <div className="flex items-center space-x-4">
+                     <div className={`w-3.5 h-3.5 rounded-full ring-4 ${state.stats.status === 'processing' ? 'bg-red-500 ring-red-500/20 animate-pulse' : 'bg-slate-600 ring-slate-600/20'}`}></div>
+                     <div>
+                        <span className="text-[11px] font-mono font-black text-white uppercase tracking-[0.3em]">TRANS-CORE FEED</span>
+                        <p className="text-[8px] text-slate-500 uppercase font-black tracking-widest mt-0.5">Packet Streaming Enabled</p>
+                     </div>
                   </div>
-                  <button 
-                    onClick={() => setAutoScroll(!autoScroll)} 
-                    className={`text-[10px] font-bold px-3 py-1 rounded-full transition-all ${autoScroll ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-slate-700 text-slate-400 border border-slate-600'}`}
-                  >
-                    {autoScroll ? 'AUTO-SCROLL ON' : 'AUTO-SCROLL OFF'}
-                  </button>
-                </div>
-                <div className="flex space-x-1">
-                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
-                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
-                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
-                </div>
-              </div>
-
-              {/* View Headers */}
-              <div className="grid grid-cols-2 border-b border-white/5 bg-slate-900/50">
-                <div className="p-3 text-center border-r border-white/5 text-[10px] font-black text-slate-500 uppercase tracking-widest">Source Input</div>
-                <div className="p-3 text-center text-[10px] font-black text-slate-500 uppercase tracking-widest">Synthesized Output</div>
-              </div>
-
-              {/* Feed Content */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-hide font-mono">
-                {state.preview.map((p, i) => (
-                  <div key={i} className="grid grid-cols-2 gap-4 group transition-all border-b border-white/5 pb-3 mb-1">
-                    <div className="p-4 bg-slate-800/20 rounded-2xl border border-white/5 relative">
-                      <p className="text-slate-400 text-xs leading-relaxed line-clamp-6 select-all" dir="rtl">{p.original}</p>
-                    </div>
-                    <div className="p-4 bg-indigo-500/5 rounded-2xl border border-indigo-500/10 group-hover:bg-indigo-500/10 transition-colors relative">
-                      <button 
-                        onClick={() => copyToClipboard(p.converted)}
-                        className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-800 text-indigo-400 text-[10px] p-2 rounded-lg border border-indigo-500/30 hover:bg-slate-700"
-                        title="Copy this chunk"
-                      >
-                        <i className="fas fa-copy"></i>
-                      </button>
-                      <p className="text-indigo-200/90 text-xs leading-relaxed select-text">{p.converted}</p>
-                    </div>
+                  <div className="flex items-center space-x-3">
+                    <button onClick={() => setAutoScroll(!autoScroll)} className={`text-[9px] font-black px-5 py-2 rounded-2xl border transition-all ${autoScroll ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
+                        {autoScroll ? 'AUTO-FOLLOW' : 'MANUAL'}
+                    </button>
                   </div>
-                ))}
+               </div>
 
-                {(streamingText || currentOriginal) && (
-                  <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500 py-4 border-t border-indigo-500/30 bg-indigo-500/5 rounded-3xl mt-4 px-2">
-                    <div className="p-4 bg-slate-800/60 rounded-2xl border border-white/10">
-                      <p className="text-slate-300 text-xs leading-relaxed" dir="rtl">{currentOriginal || 'Waiting for buffer...'}</p>
+               <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-hide">
+                  {state.preview.map((p, i) => (
+                    <div key={i} className="grid grid-cols-1 md:grid-cols-2 gap-8 animate-in fade-in slide-in-from-bottom-6 duration-700">
+                      <div className="bg-slate-800/20 p-6 rounded-[2rem] border border-white/5 shadow-inner">
+                        <div className="flex justify-between items-center mb-4">
+                            <p className="text-slate-600 text-[9px] font-black uppercase tracking-widest">Urdu Segment</p>
+                            <span className="text-[8px] bg-slate-700/50 text-slate-500 px-2 py-0.5 rounded">ORIGINAL</span>
+                        </div>
+                        <p className="text-slate-300 text-base leading-relaxed text-right" dir="rtl">{p.original}</p>
+                      </div>
+                      <div className="bg-indigo-500/5 p-6 rounded-[2rem] border border-indigo-500/10 group relative shadow-2xl">
+                        <div className="flex justify-between items-center mb-4">
+                            <p className="text-indigo-500/60 text-[9px] font-black uppercase tracking-widest">Roman Output</p>
+                            <button onClick={() => copyToClipboard(p.converted)} className="text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity p-2 hover:bg-indigo-500/10 rounded-lg">
+                                <i className="fas fa-copy"></i>
+                            </button>
+                        </div>
+                        <p className="text-indigo-100 text-base leading-relaxed font-medium">{p.converted}</p>
+                      </div>
                     </div>
-                    <div className="p-4 bg-green-500/10 rounded-2xl border border-green-500/30">
-                      <p className="text-green-300 text-xs leading-relaxed whitespace-pre-wrap select-text">
-                        {streamingText}
-                        <span className="inline-block w-2.5 h-4 bg-green-400 ml-1 animate-ping"></span>
-                      </p>
-                    </div>
-                  </div>
-                )}
+                  ))}
 
-                {!state.preview.length && !streamingText && !state.error && (
-                  <div className="h-full flex flex-col items-center justify-center text-slate-700 opacity-20">
-                    <i className="fas fa-microchip text-7xl mb-6"></i>
-                    <p className="font-black tracking-widest text-lg uppercase">Pipeline Ready</p>
-                  </div>
-                )}
-                <div ref={previewEndRef} />
-              </div>
+                  {(streamingText || currentOriginal) && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8 py-10 border-y border-white/5 bg-indigo-500/5 rounded-[2.5rem] px-6 shadow-2xl animate-pulse">
+                       <div className="opacity-40 grayscale scale-95 blur-[0.5px]">
+                         <p className="text-indigo-200 text-sm leading-relaxed text-right" dir="rtl">{currentOriginal || 'Fetching packets...'}</p>
+                       </div>
+                       <div className="relative">
+                         <div className="absolute -top-4 -left-4 bg-green-500 text-black text-[9px] px-3 py-1 rounded-full font-black animate-bounce shadow-lg shadow-green-500/20">UPLINK ACTIVE</div>
+                         <p className="text-green-300 text-sm leading-relaxed font-mono whitespace-pre-wrap">
+                           {streamingText}
+                           <span className="inline-block w-2.5 h-5 bg-green-400 ml-1 animate-pulse"></span>
+                         </p>
+                       </div>
+                    </div>
+                  )}
+
+                  {!state.preview.length && !streamingText && (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-800 select-none grayscale opacity-30">
+                      <div className="relative mb-8">
+                        <i className="fas fa-microchip text-[120px]"></i>
+                        <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-10"></div>
+                      </div>
+                      <p className="font-black text-3xl uppercase tracking-[0.6em]">Core Standby</p>
+                      <p className="text-xs mt-4 tracking-widest font-bold">READY FOR LARGE VOLUME INGESTION</p>
+                    </div>
+                  )}
+                  <div ref={previewEndRef} />
+               </div>
+
+               {/* Stats Overlay */}
+               {state.stats.status !== 'idle' && (
+                 <div className="absolute bottom-10 left-10 right-10 bg-slate-900/95 backdrop-blur-3xl p-6 rounded-[2.5rem] border border-slate-700/50 shadow-2xl flex items-center justify-between animate-in slide-in-from-bottom-10">
+                    <div className="flex-1 mr-12">
+                       <div className="flex justify-between text-[10px] font-black text-slate-500 mb-3 tracking-widest">
+                          <span>TOTAL PACKET FLOW: {progressPercent}%</span>
+                          <span>ETA: {state.stats.estimatedTimeRemaining ? `~${Math.ceil(state.stats.estimatedTimeRemaining / 60)}m ${Math.floor(state.stats.estimatedTimeRemaining % 60)}s` : '--:--'}</span>
+                       </div>
+                       <div className="h-2.5 bg-white/5 rounded-full overflow-hidden border border-white/5">
+                         <div className="h-full bg-indigo-600 shadow-[0_0_20px_rgba(79,70,229,0.7)] transition-all duration-1000 ease-out" style={{ width: `${progressPercent}%` }}></div>
+                       </div>
+                    </div>
+                    <div className="text-right">
+                       <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Processed</p>
+                       <p className="text-indigo-400 font-mono font-black text-lg">
+                        {processedItems.toLocaleString()} <span className="text-[10px] text-slate-600">{state.file?.name.endsWith('.pdf') ? 'Pages' : 'Bytes'}</span>
+                       </p>
+                    </div>
+                 </div>
+               )}
             </div>
           </div>
         </div>
       </div>
 
-      {/* Minimized Controller */}
+      {/* APK-Style Bottom Bar (when minimized) */}
       {isMinimized && (
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-10">
-          <div className="bg-slate-900 border-4 border-slate-800 rounded-3xl shadow-2xl p-4 flex items-center space-x-6 min-w-[400px]">
-            <div className="flex items-center space-x-4">
-              <div className={`w-3 h-3 rounded-full ${state.stats.status === 'processing' ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}`}></div>
-              <div>
-                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Active Progress</p>
-                <p className="text-sm font-black text-white">{progressPercent}% Completed</p>
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-24">
+           <div className="bg-slate-900 border-4 border-slate-800 p-4 rounded-[3rem] shadow-[0_35px_60px_-15px_rgba(0,0,0,0.8)] flex items-center space-x-8 min-w-[380px] backdrop-blur-2xl">
+              <div className="flex items-center space-x-5 pl-6">
+                 <div className={`w-4 h-4 rounded-full ${state.stats.status === 'processing' ? 'bg-green-500 shadow-[0_0_15px_rgba(34,197,94,0.6)] animate-pulse' : 'bg-slate-700'}`}></div>
+                 <div>
+                    <p className="text-white font-black text-sm">{progressPercent}% Core Ingestion</p>
+                    <p className="text-[8px] text-slate-500 uppercase font-black tracking-widest">{state.stats.status}</p>
+                 </div>
               </div>
-            </div>
-            
-            <div className="h-10 w-px bg-white/10"></div>
-            
-            <div className="flex items-center space-x-2">
-              {state.stats.status === 'processing' ? (
-                <button onClick={pauseConversion} className="w-10 h-10 flex items-center justify-center bg-amber-500 text-white rounded-xl hover:bg-amber-600 transition-all">
-                  <i className="fas fa-pause"></i>
-                </button>
-              ) : (
-                <button onClick={processFile} className="w-10 h-10 flex items-center justify-center bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all">
-                  <i className="fas fa-play"></i>
-                </button>
-              )}
-              <button onClick={stopConversion} className="w-10 h-10 flex items-center justify-center bg-slate-800 text-red-500 rounded-xl hover:bg-red-900 transition-all">
-                <i className="fas fa-stop"></i>
-              </button>
-            </div>
-
-            <div className="h-10 w-px bg-white/10"></div>
-
-            <button onClick={() => setIsMinimized(false)} className="w-10 h-10 flex items-center justify-center bg-white/5 text-white rounded-xl hover:bg-white/10 transition-all">
-              <i className="fas fa-expand"></i>
-            </button>
-          </div>
+              <div className="flex space-x-3 pr-2">
+                 {state.stats.status === 'processing' ? (
+                   <button onClick={pauseConversion} className="w-14 h-14 flex items-center justify-center bg-amber-600 text-white rounded-[1.5rem] shadow-xl active:scale-95 transition-all"><i className="fas fa-pause text-lg"></i></button>
+                 ) : (
+                   <button onClick={processFile} className="w-14 h-14 flex items-center justify-center bg-indigo-600 text-white rounded-[1.5rem] shadow-xl active:scale-95 transition-all"><i className="fas fa-play text-lg"></i></button>
+                 )}
+                 <button onClick={stopConversion} className="w-14 h-14 flex items-center justify-center bg-slate-800 text-red-500 rounded-[1.5rem] border border-slate-700 shadow-xl active:scale-95 transition-all"><i className="fas fa-stop text-lg"></i></button>
+                 <button onClick={() => setIsMinimized(false)} className="w-14 h-14 flex items-center justify-center bg-white/5 text-white rounded-[1.5rem] border border-white/10 shadow-xl active:scale-95 transition-all"><i className="fas fa-expand-alt text-lg"></i></button>
+              </div>
+           </div>
         </div>
       )}
     </div>
