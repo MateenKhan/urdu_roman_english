@@ -1,13 +1,14 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { GeminiService, StreamInput } from './services/geminiService';
-import { AppState, ConversionStats, ChunkResult, ResumeMetadata } from './types';
+import { AppState, ResumeMetadata } from './types';
 import * as pdfjs from 'pdfjs-dist';
+import { Document, Packer, Paragraph, TextRun } from 'docx';
 
 pdfjs.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.0.379/build/pdf.worker.mjs';
 
 const DEFAULT_CHUNK_SIZE_KB = 32;
-const MAX_PREVIEW_CHUNKS = 50; // Increased for better history
+const MAX_PREVIEW_CHUNKS = 100;
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>({
@@ -32,21 +33,28 @@ const App: React.FC = () => {
   const [totalItems, setTotalItems] = useState<number>(0);
   const [processedItems, setProcessedItems] = useState<number>(0);
   
+  // New features state
+  const [rangeStart, setRangeStart] = useState<string>("");
+  const [rangeEnd, setRangeEnd] = useState<string>("");
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  
   const geminiRef = useRef<GeminiService | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const previewEndRef = useRef<HTMLDivElement>(null);
   const finalChunksRef = useRef<string[]>([]);
   const isPausedRef = useRef<boolean>(false);
+  const isRunningRef = useRef<boolean>(false);
 
   useEffect(() => {
     geminiRef.current = new GeminiService();
   }, []);
 
   useEffect(() => {
-    if (previewEndRef.current) {
+    if (autoScroll && previewEndRef.current) {
       previewEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [state.preview, streamingText]);
+  }, [state.preview, streamingText, autoScroll]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -71,10 +79,18 @@ const App: React.FC = () => {
         },
         error: null
       }));
+      
+      if (isPdf) {
+        // Just for visual feedback, we'll update totalItems later during process
+        setRangeStart("1");
+      }
     }
   };
 
   const resetSession = () => {
+    abortControllerRef.current?.abort();
+    isRunningRef.current = false;
+    isPausedRef.current = false;
     finalChunksRef.current = [];
     setStreamingText("");
     setCurrentOriginal("");
@@ -94,7 +110,6 @@ const App: React.FC = () => {
   };
 
   const stopConversion = () => {
-    abortControllerRef.current?.abort();
     resetSession();
   };
 
@@ -115,6 +130,8 @@ const App: React.FC = () => {
         setProcessedItems(metadata.lastProcessedIndex);
         setTotalItems(metadata.totalItems);
         setUseOCR(metadata.useOCR);
+        if (metadata.rangeStart) setRangeStart(metadata.rangeStart.toString());
+        if (metadata.rangeEnd) setRangeEnd(metadata.rangeEnd.toString());
         
         setState(prev => ({
           ...prev,
@@ -139,15 +156,54 @@ const App: React.FC = () => {
       lastProcessedIndex: processedItems,
       accumulatedContent: finalChunksRef.current,
       useOCR,
-      totalItems
+      totalItems,
+      rangeStart: rangeStart ? parseInt(rangeStart) : undefined,
+      rangeEnd: rangeEnd ? parseInt(rangeEnd) : undefined
     };
     const blob = new Blob([JSON.stringify(metadata, null, 2)], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${state.file.name}_meta.txt`;
+    a.download = `${state.file.name}_recovery_meta.txt`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const exportToDocx = async () => {
+    if (!finalChunksRef.current.length) return;
+    try {
+      const doc = new Document({
+        sections: [{
+          properties: {},
+          children: finalChunksRef.current.map(text => 
+            new Paragraph({
+              children: [new TextRun({ text: text.trim(), size: 24 })],
+              spacing: { after: 200 }
+            })
+          ),
+        }],
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Roman_${state.file?.name.replace(/\.[^/.]+$/, "")}.docx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("DOCX Export Error", err);
+      setState(prev => ({ ...prev, error: "Failed to generate Word document." }));
+    }
+  };
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    // Visual feedback could be added here
+  };
+
+  const copyAllToClipboard = () => {
+    copyToClipboard(finalChunksRef.current.join("\n\n"));
   };
 
   const pdfToImageBase64 = async (pdfDoc: any, pageNum: number): Promise<string> => {
@@ -155,7 +211,7 @@ const App: React.FC = () => {
     const viewport = page.getViewport({ scale: 1.5 });
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
-    if (!context) throw new Error("Canvas Error");
+    if (!context) throw new Error("Canvas Context Fail");
     canvas.height = viewport.height;
     canvas.width = viewport.width;
     await page.render({ canvasContext: context, viewport }).promise;
@@ -163,8 +219,9 @@ const App: React.FC = () => {
   };
 
   const processFile = async () => {
-    if (!state.file || !geminiRef.current) return;
+    if (!state.file || !geminiRef.current || isRunningRef.current) return;
     
+    isRunningRef.current = true;
     isPausedRef.current = false;
     abortControllerRef.current = new AbortController();
     const startTime = Date.now();
@@ -187,14 +244,14 @@ const App: React.FC = () => {
           reader.readAsDataURL(state.file!);
         });
         const base64 = await base64Promise;
-        setCurrentOriginal("Image Content Extraction...");
+        setCurrentOriginal("Processing image...");
         let fullText = "";
         for await (const chunk of geminiRef.current.convertStream([{ data: base64, mimeType: state.file.type }])) {
           if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
           setStreamingText(prev => prev + chunk);
           fullText += chunk;
         }
-        if (!isPausedRef.current) {
+        if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
           finalChunksRef.current = [fullText];
           setProcessedItems(1);
           updateProgress(1, startTime, "Uploaded Image", fullText);
@@ -203,14 +260,19 @@ const App: React.FC = () => {
         const arrayBuffer = await state.file.arrayBuffer();
         const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
         const totalPages = pdf.numPages;
-        setTotalItems(totalPages);
         
-        let currentPage = processedItems + 1;
+        const start = rangeStart ? Math.max(1, parseInt(rangeStart)) : 1;
+        const end = rangeEnd ? Math.min(totalPages, parseInt(rangeEnd)) : totalPages;
+        
+        setTotalItems(end);
+        
+        let currentPage = Math.max(start, processedItems + 1);
 
-        while (currentPage <= totalPages) {
+        while (currentPage <= end) {
           if (abortControllerRef.current.signal.aborted || isPausedRef.current) break;
           
-          const currentBatchSize = Math.min(batchSize, totalPages - currentPage + 1);
+          const remainingPages = end - currentPage + 1;
+          const currentBatchSize = Math.min(batchSize, remainingPages);
           const batchInputs: StreamInput[] = [];
           const batchOriginalTexts: string[] = [];
 
@@ -219,7 +281,7 @@ const App: React.FC = () => {
             if (useOCR) {
               const base64 = await pdfToImageBase64(pdf, pageNum);
               batchInputs.push({ data: base64, mimeType: 'image/jpeg' });
-              batchOriginalTexts.push(`Page ${pageNum} (Scanned)`);
+              batchOriginalTexts.push(`Page ${pageNum} (OCR)`);
             } else {
               const page = await pdf.getPage(pageNum);
               const content = await page.getTextContent();
@@ -241,11 +303,12 @@ const App: React.FC = () => {
               batchResult += chunk;
             }
             
-            if (!isPausedRef.current) {
+            if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
               finalChunksRef.current.push(batchResult + "\n\n");
-              updateProgress(Math.min(currentPage + currentBatchSize - 1, totalPages) / totalPages, startTime, batchOriginalTexts.join(" | "), batchResult);
+              const nextProcessed = Math.min(currentPage + currentBatchSize - 1, end);
+              updateProgress(nextProcessed / end, startTime, batchOriginalTexts.join(" | "), batchResult);
               currentPage += currentBatchSize;
-              setProcessedItems(currentPage - 1);
+              setProcessedItems(nextProcessed);
             }
           } else {
             currentPage += currentBatchSize;
@@ -253,7 +316,7 @@ const App: React.FC = () => {
           }
         }
       } else {
-        // Text Buffering
+        // Text Buffering - Range functionality not applicable to raw offset text but could be added as line counts if needed
         let offset = processedItems;
         const file = state.file;
         const totalSize = file.size;
@@ -288,15 +351,15 @@ const App: React.FC = () => {
               batchResult += streamChunk;
             }
             
-            if (!isPausedRef.current) {
+            if (!isPausedRef.current && !abortControllerRef.current.signal.aborted) {
               finalChunksRef.current.push(batchResult + "\n");
               updateProgress(Math.min(currentBatchOffset, totalSize) / totalSize, startTime, batchOriginals.join(" | "), batchResult);
               offset = currentBatchOffset;
-              setProcessedItems(Math.min(offset, totalSize));
+              setProcessedItems(offset);
             }
           } else {
              offset = currentBatchOffset;
-             setProcessedItems(Math.min(offset, totalSize));
+             setProcessedItems(offset);
           }
         }
       }
@@ -313,10 +376,12 @@ const App: React.FC = () => {
       console.error('Processing error:', err);
       setState(prev => ({
         ...prev,
-        error: `Stream Error: ${err.message}`,
+        error: `Stream Terminated: ${err.message}`,
         stats: { ...prev.stats, status: 'error' }
       }));
       setStreamingText("");
+    } finally {
+      isRunningRef.current = false;
     }
   };
 
@@ -336,7 +401,7 @@ const App: React.FC = () => {
     }));
   };
 
-  const downloadResult = () => {
+  const downloadResultTxt = () => {
     if (!finalChunksRef.current.length || !state.file) return;
     const blob = new Blob(finalChunksRef.current, { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -352,74 +417,80 @@ const App: React.FC = () => {
     : 0;
 
   return (
-    <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6 lg:px-8 font-sans">
-      <div className="max-w-7xl mx-auto">
-        <header className="flex flex-col md:flex-row items-center justify-between mb-8 gap-4">
+    <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6 lg:px-8 font-sans transition-all">
+      <div className={`max-w-7xl mx-auto ${isMinimized ? 'blur-sm' : ''}`}>
+        <header className="flex flex-col md:flex-row items-center justify-between mb-8 gap-6">
           <div className="flex items-center space-x-4">
             <div className="p-3 bg-indigo-600 rounded-2xl shadow-lg text-white">
-              <i className="fas fa-language text-3xl"></i>
+              <i className="fas fa-microchip text-3xl"></i>
             </div>
             <div>
               <h1 className="text-3xl font-black text-slate-900 tracking-tight">
-                Urdu<span className="text-indigo-600">2</span>Roman <span className="text-xs align-middle bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-1">SIDE-BY-SIDE</span>
+                Urdu<span className="text-indigo-600">2</span>Roman <span className="text-xs align-middle bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-1">V2.2 X-STREAM</span>
               </h1>
-              <p className="text-sm text-slate-500">Professional Book Transliteration Engine</p>
+              <p className="text-sm text-slate-500 font-medium">Professional Buffer Pipeline</p>
             </div>
           </div>
           
-          {/* Transport Controls */}
-          <div className="flex items-center bg-white p-2 rounded-2xl shadow-md border border-slate-200 space-x-2">
-            {state.file && (state.stats.status === 'idle' || state.stats.status === 'paused' || state.stats.status === 'error') ? (
+          <div className="flex items-center bg-white p-3 rounded-2xl shadow-xl border border-slate-200 space-x-3">
+            <div className="hidden md:flex flex-col pr-4 border-r border-slate-100 items-end">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Transport</span>
+                <span className={`text-[10px] font-bold uppercase ${state.stats.status === 'processing' ? 'text-green-500' : 'text-slate-400'}`}>
+                    {state.stats.status}
+                </span>
+            </div>
+
+            {state.file && (state.stats.status === 'idle' || state.stats.status === 'paused' || state.stats.status === 'error') && (
               <button 
                 onClick={processFile}
-                className="flex items-center space-x-2 px-6 py-2 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-all shadow-md active:scale-95"
+                className="group relative flex items-center space-x-2 px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-black hover:bg-indigo-700 transition-all shadow-lg active:scale-95"
               >
-                <i className="fas fa-play text-sm"></i>
-                <span>{state.stats.status === 'paused' ? 'Resume' : 'Play'}</span>
+                <i className="fas fa-play text-xs"></i>
+                <span className="text-sm">{state.stats.status === 'paused' ? 'RESUME' : 'PLAY'}</span>
               </button>
-            ) : null}
+            )}
 
             {state.stats.status === 'processing' && (
               <button 
                 onClick={pauseConversion}
-                className="flex items-center space-x-2 px-6 py-2 bg-amber-500 text-white rounded-xl font-bold hover:bg-amber-600 transition-all shadow-md active:scale-95"
+                className="flex items-center space-x-2 px-6 py-2.5 bg-amber-500 text-white rounded-xl font-black hover:bg-amber-600 transition-all shadow-lg active:scale-95"
               >
-                <i className="fas fa-pause text-sm"></i>
-                <span>Pause</span>
+                <i className="fas fa-pause text-xs"></i>
+                <span className="text-sm">PAUSE</span>
               </button>
             )}
 
             {(state.stats.status !== 'idle') && (
               <button 
                 onClick={stopConversion}
-                className="flex items-center space-x-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-all active:scale-95"
+                title="Stop & Reset"
+                className="flex items-center justify-center w-10 h-10 bg-slate-100 text-red-500 rounded-xl font-bold hover:bg-red-50 transition-all active:scale-95 border border-slate-200"
               >
-                <i className="fas fa-stop text-sm text-red-500"></i>
-                <span>Stop</span>
+                <i className="fas fa-square text-xs"></i>
               </button>
             )}
+
+            <div className="h-8 w-px bg-slate-100 mx-1"></div>
             
-            {state.stats.status === 'completed' && (
-              <button 
-                onClick={downloadResult}
-                className="flex items-center space-x-2 px-6 py-2 bg-green-600 text-white rounded-xl font-bold hover:bg-green-700 transition-all shadow-md active:scale-95"
-              >
-                <i className="fas fa-file-download text-sm"></i>
-                <span>Export Book</span>
-              </button>
-            )}
+            <button 
+              onClick={() => setIsMinimized(true)}
+              className="w-10 h-10 flex items-center justify-center bg-slate-50 text-slate-500 rounded-xl hover:bg-slate-100 transition-all"
+              title="Minimize Dashboard"
+            >
+              <i className="fas fa-minus"></i>
+            </button>
           </div>
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Settings Sidebar */}
+          {/* Sidebar */}
           <div className="lg:col-span-3 space-y-6">
             <section className="bg-white rounded-3xl shadow-sm p-6 border border-slate-200 space-y-6">
-              <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest flex items-center">
-                <i className="fas fa-sliders-h mr-2"></i> Session Settings
+              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] flex items-center">
+                <i className="fas fa-cog mr-2 text-indigo-500"></i> Buffer Config
               </h2>
               
-              <div className="space-y-4">
+              <div className="space-y-5">
                 <div className="relative group">
                   <input 
                     type="file" 
@@ -428,176 +499,202 @@ const App: React.FC = () => {
                     className="absolute inset-0 opacity-0 cursor-pointer z-10"
                     disabled={state.stats.status === 'processing'}
                   />
-                  <div className={`p-4 border-2 border-dashed rounded-2xl transition-all text-center ${state.file ? 'border-green-200 bg-green-50' : 'border-slate-200 group-hover:border-indigo-400'}`}>
-                    <i className={`fas ${state.file ? 'fa-file-alt text-green-500' : 'fa-cloud-upload-alt text-slate-300'} text-2xl mb-2`}></i>
-                    <p className="text-[10px] font-bold text-slate-600 truncate px-2">
-                      {state.file ? state.file.name : "Choose Book or Image"}
+                  <div className={`p-5 border-2 border-dashed rounded-2xl transition-all text-center ${state.file ? 'border-indigo-500 bg-indigo-50/30' : 'border-slate-200 group-hover:border-indigo-400 bg-slate-50/50'}`}>
+                    <i className={`fas ${state.file ? 'fa-book-open text-indigo-600' : 'fa-upload text-slate-300'} text-3xl mb-3`}></i>
+                    <p className="text-[11px] font-bold text-slate-700 truncate px-2">
+                      {state.file ? state.file.name : "LOAD SOURCE FILE"}
                     </p>
+                    <p className="text-[9px] text-slate-400 mt-1 uppercase">PDF, TXT, or Image</p>
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between p-3 bg-slate-50 rounded-2xl border border-slate-100">
-                  <span className="text-xs font-bold text-slate-700 flex items-center">
-                    <i className="fas fa-camera text-indigo-500 mr-2"></i> OCR
-                  </span>
-                  <label className="relative inline-flex items-center cursor-pointer">
-                    <input type="checkbox" checked={useOCR} onChange={() => setUseOCR(!useOCR)} className="sr-only peer" disabled={state.stats.status === 'processing'} />
-                    <div className="w-10 h-5 bg-slate-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:bg-indigo-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all"></div>
-                  </label>
-                </div>
-
-                <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100 space-y-2">
-                  <div className="flex justify-between items-center text-xs font-bold text-slate-700">
-                    <span>Batch Density</span>
-                    <span className="text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full">{batchSize}x</span>
+                {state.file?.name.endsWith('.pdf') && (
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
+                    <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">Page Range</span>
+                    <div className="flex items-center space-x-2">
+                      <input 
+                        type="number" 
+                        placeholder="Start"
+                        value={rangeStart}
+                        onChange={(e) => setRangeStart(e.target.value)}
+                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs font-mono"
+                        disabled={state.stats.status === 'processing'}
+                      />
+                      <span className="text-slate-400">to</span>
+                      <input 
+                        type="number" 
+                        placeholder="End"
+                        value={rangeEnd}
+                        onChange={(e) => setRangeEnd(e.target.value)}
+                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs font-mono"
+                        disabled={state.stats.status === 'processing'}
+                      />
+                    </div>
                   </div>
-                  <input type="range" min="1" max="10" value={batchSize} onChange={(e) => setBatchSize(parseInt(e.target.value))} className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" disabled={state.stats.status === 'processing'} />
+                )}
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                    <span className="text-xs font-black text-slate-700 uppercase tracking-wider flex items-center">
+                      <i className="fas fa-eye text-indigo-500 mr-2"></i> Vision OCR
+                    </span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" checked={useOCR} onChange={() => setUseOCR(!useOCR)} className="sr-only peer" disabled={state.stats.status === 'processing'} />
+                      <div className="w-11 h-6 bg-slate-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:bg-indigo-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                    </label>
+                  </div>
+
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-black text-slate-700 uppercase tracking-wider">Batch Depth</span>
+                      <span className="text-indigo-600 font-mono font-bold bg-white px-2 py-0.5 rounded-lg border border-indigo-100 text-xs">{batchSize} Pgs</span>
+                    </div>
+                    <input 
+                        type="range" 
+                        min="1" 
+                        max="10" 
+                        value={batchSize} 
+                        onChange={(e) => setBatchSize(parseInt(e.target.value))} 
+                        className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600" 
+                        disabled={state.stats.status === 'processing'} 
+                    />
+                  </div>
                 </div>
               </div>
             </section>
 
             <section className="bg-white rounded-3xl shadow-sm p-6 border border-slate-200">
-              <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Metadata Recovery</h2>
-              <div className="grid grid-cols-2 gap-2">
-                <button onClick={downloadMetadata} disabled={!state.file || finalChunksRef.current.length === 0} className="p-3 bg-slate-50 rounded-xl border border-slate-100 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50">
-                  <i className="fas fa-download block mb-1"></i> Save Meta
-                </button>
-                <div className="relative">
-                  <input type="file" onChange={handleMetadataUpload} accept=".txt" className="absolute inset-0 opacity-0 cursor-pointer" />
-                  <button className="w-full p-3 bg-indigo-50 rounded-xl border border-indigo-100 text-[10px] font-bold text-indigo-600 hover:bg-indigo-100 pointer-events-none">
-                    <i className="fas fa-upload block mb-1"></i> Load Meta
+              <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-4">Export Options</h2>
+              <div className="grid grid-cols-1 gap-3">
+                <div className="flex space-x-2">
+                  <button onClick={downloadResultTxt} disabled={!finalChunksRef.current.length} className="flex-1 p-3 bg-slate-50 rounded-xl border border-slate-100 text-[10px] font-black text-slate-600 hover:bg-slate-100 disabled:opacity-40">
+                    <i className="fas fa-file-alt mr-2 text-slate-400"></i> TXT
+                  </button>
+                  <button onClick={exportToDocx} disabled={!finalChunksRef.current.length} className="flex-1 p-3 bg-indigo-50 rounded-xl border border-indigo-100 text-[10px] font-black text-indigo-600 hover:bg-indigo-100 disabled:opacity-40">
+                    <i className="fas fa-file-word mr-2 text-indigo-400"></i> DOCX
                   </button>
                 </div>
+                <button onClick={copyAllToClipboard} disabled={!finalChunksRef.current.length} className="w-full p-3 bg-slate-50 rounded-xl border border-slate-100 text-[10px] font-black text-slate-600 hover:bg-slate-100 disabled:opacity-40">
+                  <i className="fas fa-copy mr-2 text-slate-400"></i> COPY ALL
+                </button>
               </div>
             </section>
-
-            {state.stats.status !== 'idle' && (
-              <section className="bg-white rounded-3xl shadow-sm p-6 border border-slate-200 space-y-4">
-                <div className="flex justify-between text-xs font-black uppercase tracking-widest text-slate-400">
-                  <span>Progress</span>
-                  <span>{progressPercent}%</span>
-                </div>
-                <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                  <div className="h-full bg-indigo-600 transition-all duration-700" style={{ width: `${progressPercent}%` }}></div>
-                </div>
-                <div className="grid grid-cols-2 gap-4 text-center">
-                  <div className="bg-slate-50 p-2 rounded-xl">
-                    <p className="text-[10px] font-bold text-slate-400">UNIT</p>
-                    <p className="text-sm font-black text-indigo-600">{processedItems}/{totalItems}</p>
-                  </div>
-                  <div className="bg-slate-50 p-2 rounded-xl">
-                    <p className="text-[10px] font-bold text-slate-400">TIME</p>
-                    <p className="text-sm font-black text-indigo-600">{state.stats.estimatedTimeRemaining ? `${Math.ceil(state.stats.estimatedTimeRemaining / 60)}m` : '--'}</p>
-                  </div>
-                </div>
-              </section>
-            )}
           </div>
 
-          {/* Main Feed - Side-by-Side */}
+          {/* Monitoring Feed */}
           <div className="lg:col-span-9">
-            <div className="bg-slate-900 rounded-[2.5rem] shadow-2xl border-8 border-slate-800 flex flex-col h-[750px] overflow-hidden">
+            <div className="bg-slate-900 rounded-[2.5rem] shadow-2xl border-8 border-slate-800 flex flex-col h-[800px] overflow-hidden">
               {/* Feed Header */}
-              <div className="bg-slate-800/50 p-4 border-b border-white/5 flex items-center justify-between">
-                <div className="flex items-center space-x-6 text-[10px] font-mono tracking-widest uppercase">
-                  <div className="flex items-center space-x-2 text-slate-400">
-                     <div className={`w-2 h-2 rounded-full ${state.stats.status === 'processing' ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}`}></div>
-                     <span>Live Monitor</span>
+              <div className="bg-slate-800/50 px-6 py-4 border-b border-white/5 flex items-center justify-between">
+                <div className="flex items-center space-x-4">
+                  <div className="flex items-center space-x-2">
+                     <div className={`w-2.5 h-2.5 rounded-full ${state.stats.status === 'processing' ? 'bg-red-500 animate-pulse' : 'bg-slate-600'}`}></div>
+                     <span className="text-[11px] font-mono font-black text-slate-300 uppercase tracking-widest">Live Output Monitor</span>
                   </div>
-                  <div className="text-slate-500">Channel: Urdu_UTF8 >> Roman_EN</div>
+                  <button 
+                    onClick={() => setAutoScroll(!autoScroll)} 
+                    className={`text-[10px] font-bold px-3 py-1 rounded-full transition-all ${autoScroll ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-slate-700 text-slate-400 border border-slate-600'}`}
+                  >
+                    {autoScroll ? 'AUTO-SCROLL ON' : 'AUTO-SCROLL OFF'}
+                  </button>
                 </div>
-                <div className="flex items-center space-x-2">
-                   <span className="text-[10px] font-mono text-indigo-400 bg-indigo-400/10 px-2 py-0.5 rounded">BUFF_SIZE: {batchSize}X</span>
+                <div className="flex space-x-1">
+                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
+                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
+                   <div className="w-1.5 h-1.5 rounded-full bg-slate-700"></div>
                 </div>
               </div>
 
-              {/* Comparison Grid Header */}
-              <div className="grid grid-cols-2 border-b border-white/5 bg-slate-900">
-                <div className="p-3 text-center border-r border-white/5 text-[10px] font-bold text-slate-500 uppercase tracking-widest">Original Input</div>
-                <div className="p-3 text-center text-[10px] font-bold text-slate-500 uppercase tracking-widest">Roman Output</div>
+              {/* View Headers */}
+              <div className="grid grid-cols-2 border-b border-white/5 bg-slate-900/50">
+                <div className="p-3 text-center border-r border-white/5 text-[10px] font-black text-slate-500 uppercase tracking-widest">Source Input</div>
+                <div className="p-3 text-center text-[10px] font-black text-slate-500 uppercase tracking-widest">Synthesized Output</div>
               </div>
 
               {/* Feed Content */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-1 scrollbar-hide font-mono">
-                {state.error && (
-                  <div className="m-4 p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-xs">
-                    <i className="fas fa-exclamation-circle mr-2"></i> {state.error}
-                  </div>
-                )}
-
+              <div className="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-hide font-mono">
                 {state.preview.map((p, i) => (
-                  <div key={i} className="grid grid-cols-2 gap-4 group transition-all border-b border-white/5 pb-2 mb-2">
-                    <div className="p-4 bg-slate-800/30 rounded-2xl border border-white/5 group-hover:bg-slate-800/50 transition-colors">
-                      <div className="text-[8px] text-slate-600 mb-1 flex justify-between">
-                        <span>CHUNK_{i.toString().padStart(3, '0')}</span>
-                        <span>SOURCE</span>
-                      </div>
-                      <p className="text-slate-400 text-xs leading-relaxed line-clamp-4 overflow-hidden" dir="rtl">{p.original}</p>
+                  <div key={i} className="grid grid-cols-2 gap-4 group transition-all border-b border-white/5 pb-3 mb-1">
+                    <div className="p-4 bg-slate-800/20 rounded-2xl border border-white/5 relative">
+                      <p className="text-slate-400 text-xs leading-relaxed line-clamp-6 select-all" dir="rtl">{p.original}</p>
                     </div>
-                    <div className="p-4 bg-indigo-600/5 rounded-2xl border border-indigo-500/10 group-hover:bg-indigo-600/10 transition-colors">
-                      <div className="text-[8px] text-indigo-500/50 mb-1 flex justify-between">
-                        <span>PROCESSED</span>
-                        <i className="fas fa-check-circle"></i>
-                      </div>
-                      <p className="text-indigo-100 text-xs leading-relaxed">{p.converted}</p>
+                    <div className="p-4 bg-indigo-500/5 rounded-2xl border border-indigo-500/10 group-hover:bg-indigo-500/10 transition-colors relative">
+                      <button 
+                        onClick={() => copyToClipboard(p.converted)}
+                        className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-800 text-indigo-400 text-[10px] p-2 rounded-lg border border-indigo-500/30 hover:bg-slate-700"
+                        title="Copy this chunk"
+                      >
+                        <i className="fas fa-copy"></i>
+                      </button>
+                      <p className="text-indigo-200/90 text-xs leading-relaxed select-text">{p.converted}</p>
                     </div>
                   </div>
                 ))}
 
                 {(streamingText || currentOriginal) && (
-                  <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-2 duration-500 pt-2 border-t border-indigo-500/20">
-                    <div className="p-4 bg-slate-800/50 rounded-2xl border border-white/10 shadow-lg shadow-black/20">
-                      <div className="text-[8px] text-green-400 mb-2 flex items-center space-x-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></div>
-                        <span className="tracking-widest font-bold">CURRENT_INGESTION</span>
-                      </div>
-                      <p className="text-slate-300 text-xs leading-relaxed overflow-hidden" dir="rtl">{currentOriginal || 'Extracting data...'}</p>
+                  <div className="grid grid-cols-2 gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500 py-4 border-t border-indigo-500/30 bg-indigo-500/5 rounded-3xl mt-4 px-2">
+                    <div className="p-4 bg-slate-800/60 rounded-2xl border border-white/10">
+                      <p className="text-slate-300 text-xs leading-relaxed" dir="rtl">{currentOriginal || 'Waiting for buffer...'}</p>
                     </div>
-                    <div className="p-4 bg-green-900/10 rounded-2xl border border-green-500/30 shadow-[0_0_20px_rgba(34,197,94,0.1)]">
-                       <div className="text-[8px] text-green-400 mb-2 flex items-center justify-between">
-                        <span className="tracking-widest font-bold">STREAM_SYNTHESIS</span>
-                        <i className="fas fa-bolt animate-bounce"></i>
-                      </div>
-                      <p className="text-green-300 text-xs leading-relaxed whitespace-pre-wrap">
+                    <div className="p-4 bg-green-500/10 rounded-2xl border border-green-500/30">
+                      <p className="text-green-300 text-xs leading-relaxed whitespace-pre-wrap select-text">
                         {streamingText}
-                        <span className="inline-block w-2 h-4 bg-green-400 ml-1 animate-ping"></span>
+                        <span className="inline-block w-2.5 h-4 bg-green-400 ml-1 animate-ping"></span>
                       </p>
                     </div>
                   </div>
                 )}
 
                 {!state.preview.length && !streamingText && !state.error && (
-                  <div className="h-full flex flex-col items-center justify-center text-slate-700 opacity-20 select-none">
-                    <div className="mb-6 relative">
-                      <i className="fas fa-terminal text-6xl"></i>
-                      <div className="absolute -bottom-1 -right-1 w-4 h-4 bg-indigo-500 rounded-full animate-ping"></div>
-                    </div>
-                    <p className="font-black tracking-[0.3em] text-sm uppercase">Engine Standby</p>
-                    <p className="text-[10px] mt-2 italic">Select a file and press PLAY to begin uplink</p>
+                  <div className="h-full flex flex-col items-center justify-center text-slate-700 opacity-20">
+                    <i className="fas fa-microchip text-7xl mb-6"></i>
+                    <p className="font-black tracking-widest text-lg uppercase">Pipeline Ready</p>
                   </div>
                 )}
                 <div ref={previewEndRef} />
-              </div>
-
-              {/* Timeline Footer */}
-              <div className="bg-slate-800/30 px-6 py-2 border-t border-white/5 flex items-center justify-between">
-                <div className="flex items-center space-x-4">
-                   <div className="text-[9px] font-mono text-slate-500">
-                     SYSTEM: GEMINI_FLASH_V3
-                   </div>
-                   <div className="h-3 w-px bg-white/5"></div>
-                   <div className="text-[9px] font-mono text-slate-500 uppercase">
-                     MODALITY: {useOCR ? 'OCR_STREAM' : 'TEXT_PARSE'}
-                   </div>
-                </div>
-                <div className="text-[9px] font-mono text-slate-400">
-                  © 2025 TRANS-LINGUAL CORE
-                </div>
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {/* Minimized Controller */}
+      {isMinimized && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-10">
+          <div className="bg-slate-900 border-4 border-slate-800 rounded-3xl shadow-2xl p-4 flex items-center space-x-6 min-w-[400px]">
+            <div className="flex items-center space-x-4">
+              <div className={`w-3 h-3 rounded-full ${state.stats.status === 'processing' ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}`}></div>
+              <div>
+                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Active Progress</p>
+                <p className="text-sm font-black text-white">{progressPercent}% Completed</p>
+              </div>
+            </div>
+            
+            <div className="h-10 w-px bg-white/10"></div>
+            
+            <div className="flex items-center space-x-2">
+              {state.stats.status === 'processing' ? (
+                <button onClick={pauseConversion} className="w-10 h-10 flex items-center justify-center bg-amber-500 text-white rounded-xl hover:bg-amber-600 transition-all">
+                  <i className="fas fa-pause"></i>
+                </button>
+              ) : (
+                <button onClick={processFile} className="w-10 h-10 flex items-center justify-center bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all">
+                  <i className="fas fa-play"></i>
+                </button>
+              )}
+              <button onClick={stopConversion} className="w-10 h-10 flex items-center justify-center bg-slate-800 text-red-500 rounded-xl hover:bg-red-900 transition-all">
+                <i className="fas fa-stop"></i>
+              </button>
+            </div>
+
+            <div className="h-10 w-px bg-white/10"></div>
+
+            <button onClick={() => setIsMinimized(false)} className="w-10 h-10 flex items-center justify-center bg-white/5 text-white rounded-xl hover:bg-white/10 transition-all">
+              <i className="fas fa-expand"></i>
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

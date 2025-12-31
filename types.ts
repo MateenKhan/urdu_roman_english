@@ -20,6 +20,8 @@ export interface ResumeMetadata {
   accumulatedContent: string[];
   useOCR: boolean;
   totalItems: number;
+  rangeStart?: number;
+  rangeEnd?: number;
 }
 
 export interface AppState {
