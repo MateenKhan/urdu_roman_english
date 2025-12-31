@@ -1,0 +1,7 @@
+{
+  "name": "Urdu2Roman - Pro Book Converter",
+  "description": "A high-performance Urdu-to-Roman-English book converter with OCR and live streaming support.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
